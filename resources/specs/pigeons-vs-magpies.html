@@ -1,0 +1,1121 @@
+<!-- Oi mate! This is a coo! -->
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pigeons vs Magpies</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1d24; font-family: 'Trebuchet MS', system-ui, sans-serif; }
+  #game { display: block; width: 100vw; height: 100vh; cursor: default; image-rendering: optimizeQuality; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(10,12,16,0.82); z-index: 10; color: #e8e4d8;
+  }
+  #overlay .panel {
+    background: #20242e; border: 2px solid #5a6275; border-radius: 8px; padding: 32px 40px;
+    text-align: center; max-width: 520px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  }
+  #overlay h1 { font-size: 30px; letter-spacing: 1px; margin-bottom: 6px; color: #cdd6f4; }
+  #overlay h1 .v { color: #d9a441; }
+  #overlay p { color: #9aa0b0; line-height: 1.55; margin: 14px 0; font-size: 14px; }
+  #overlay .keys { font-size: 13px; color: #7f8696; text-align: left; display: inline-block; margin: 10px auto; }
+  #overlay .keys b { color: #cdd6f4; }
+  #overlay button {
+    margin-top: 18px; padding: 12px 34px; font-size: 16px; font-weight: bold; letter-spacing: 1px;
+    background: #2d5fa8; color: #fff; border: 1px solid #4d7fc8; border-radius: 6px; cursor: pointer;
+  }
+  #overlay button:hover { background: #3a72c4; }
+  #overlay .result { font-size: 22px; margin-bottom: 4px; }
+  #overlay .win { color: #7fd17f; }
+  #overlay .lose { color: #e07070; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="overlay">
+  <div class="panel">
+    <h1>Pigeons <span class="v">vs</span> Magpies</h1>
+    <p>An urban park turf war. You command the <b>Pigeons</b>. Gather breadcrumbs &amp; twigs, train a flock, and raze every Magpie building.</p>
+    <div class="keys">
+      <b>WASD / Arrows / edge</b> — pan camera<br>
+      <b>Left-click</b> — select &nbsp;·&nbsp; <b>drag</b> — box select &nbsp;·&nbsp; <b>Shift</b> — add<br>
+      <b>Right-click</b> — move / attack / gather<br>
+      <b>Bottom buttons</b> — train units, place buildings<br>
+      <b>Esc</b> — cancel selection / placement
+    </div>
+    <p style="font-size:12px;color:#6b7180">Destroy all enemy nests to win. Lose all of yours and it's over.</p>
+    <button id="startBtn">Skirmish</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+   Pigeons vs Magpies — single-file prototype (Canvas 2D)
+   Architecture mirrors the spec: balance config, entity
+   classes, and discrete systems. All drawing is isolated in
+   each entity's draw() so sprites can swap in later.
+   ============================================================ */
+
+/* ---------------------- config/balance ---------------------- */
+const BAL = {
+  world: { w: 2000, h: 2000, grid: 50 },
+  camera: { speed: 500, edge: 20 },
+
+  startStockpile: { crumbs: 200, twigs: 100 },
+  popCap: 30,
+  popPerNest: 5,
+  popPerBath: 4,
+
+  resources: {
+    crumbs: { node: 'PicnicBlanket', capacity: 5000, centreCapacity: 10000, carry: 10, time: 2.0 },
+    twigs:  { node: 'Bush',          capacity: 1500, carry: 8,  time: 2.5 },
+  },
+
+  aggroRadius: 200,
+  chaseLeash: 1.5,           // ×aggroRadius
+  defenceRadius: 300,        // enemy units near a building auto-engage
+
+  units: {
+    Forager:    { hp: 30, dmg: 2, range: 20,  cd: 1.0, speed: 80, cost: { c: 75,  t: 0  }, train: 8,  combat: false },
+    Pecker:     { hp: 60, dmg: 8, range: 20,  cd: 1.0, speed: 90, cost: { c: 100, t: 0  }, train: 10, combat: true  },
+    PoopBomber: { hp: 40, dmg: 6, range: 180, cd: 1.5, speed: 85, cost: { c: 100, t: 25 }, train: 12, combat: true, ranged: true },
+  },
+  unitRadius: 12,
+
+  buildings: {
+    MainNest:       { size: 100, hp: 600, cost: { c: 400, t: 200 }, build: 60, trains: ['Forager'],            pop: 5 },
+    Birdbath:       { size: 50,  hp: 150, cost: { c: 0,   t: 75  }, build: 15, trains: [],                     pop: 4 },
+    BranchBarracks: { size: 100, hp: 400, cost: { c: 150, t: 100 }, build: 30, trains: ['Pecker','PoopBomber'], pop: 0 },
+  },
+
+  ai: {
+    workerTarget: 4,
+    squadSize: 6,
+    firstWaveAt: 180,        // seconds
+    trickle: { c: 2, t: 1 }, // light cheat: per-second resource drip (see AISystem)
+  },
+};
+
+/* ---------------------- types / enums ---------------------- */
+const Faction = { PIGEON: 'pigeon', MAGPIE: 'magpie' };
+const UState  = { IDLE:'idle', MOVING:'moving', GATHERING:'gathering', BUILDING:'building', ATTACKING:'attacking', DEAD:'dead' };
+
+const TINT = {
+  pigeon: { body:'#8a93c4', edge:'#cdd6f4', ring:'#7fd1ff' },
+  magpie: { body:'#2b2f3a', edge:'#e8e4d8', ring:'#ff9a6b' },
+};
+
+/* ---------------------- utility ---------------------- */
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+const dist  = (a,b)=> Math.hypot(a.x-b.x, a.y-b.y);
+function len(dx,dy){ return Math.hypot(dx,dy); }
+let _id = 1; const nextId = ()=> _id++;
+
+/* ---------------------- game state ---------------------- */
+const G = {
+  running: false,
+  t: 0,
+  cam: { x: 0, y: 0, vw: 0, vh: 0 },
+  units: [],
+  buildings: [],
+  nodes: [],
+  effects: [],            // transient splats / hit lines
+  selection: [],
+  store: {
+    pigeon: { c: BAL.startStockpile.crumbs, t: BAL.startStockpile.twigs },
+    magpie: { c: BAL.startStockpile.crumbs, t: BAL.startStockpile.twigs },
+  },
+  placement: null,        // { type, builder }
+  over: null,             // 'win' | 'lose'
+};
+
+/* ---------------------- canvas ---------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  G.cam.vw = canvas.width;
+  G.cam.vh = canvas.height;
+  clampCam();
+}
+window.addEventListener('resize', resize);
+
+/* world<->screen */
+const w2sx = wx => wx - G.cam.x;
+const w2sy = wy => wy - G.cam.y;
+const s2wx = sx => sx + G.cam.x;
+const s2wy = sy => sy + G.cam.y;
+function clampCam(){
+  G.cam.x = clamp(G.cam.x, 0, Math.max(0, BAL.world.w - G.cam.vw));
+  G.cam.y = clamp(G.cam.y, 0, Math.max(0, BAL.world.h - G.cam.vh));
+}
+
+/* ============================================================
+   Entities
+   ============================================================ */
+class ResourceNode {
+  constructor(kind, x, y, capacity){
+    this.id = nextId();
+    this.kind = kind;                 // 'crumbs' | 'twigs'
+    this.x = x; this.y = y;
+    this.amount = capacity;
+    this.radius = kind==='crumbs' ? 26 : 20;
+  }
+  draw(){
+    const x=w2sx(this.x), y=w2sy(this.y);
+    ctx.save();
+    if(this.kind==='crumbs'){
+      // picnic blanket: red/white check pad
+      const s=this.radius;
+      ctx.translate(x,y);
+      ctx.fillStyle = '#b03a3a'; ctx.fillRect(-s,-s*0.7, s*2, s*1.4);
+      ctx.fillStyle = '#d8cfc0';
+      for(let i=0;i<4;i++) for(let j=0;j<3;j++) if((i+j)%2===0)
+        ctx.fillRect(-s + i*(s/2), -s*0.7 + j*(s*1.4/3), s/2, s*1.4/3);
+      ctx.strokeStyle='#7a2727'; ctx.lineWidth=1.5; ctx.strokeRect(-s,-s*0.7,s*2,s*1.4);
+      // crumbs
+      ctx.fillStyle='#e8c878';
+      for(let k=0;k<6;k++){ const a=k*1.04; ctx.fillRect(Math.cos(a)*8-1.5, Math.sin(a)*5-1.5, 3,3); }
+    } else {
+      // bush
+      ctx.fillStyle = '#3f6b3a';
+      for(const [ox,oy,r] of [[-10,2,12],[10,2,12],[0,-6,14],[0,8,11]]){
+        ctx.beginPath(); ctx.arc(x+ox,y+oy,r,0,7); ctx.fill();
+      }
+      ctx.fillStyle = '#5c8a52';
+      ctx.beginPath(); ctx.arc(x-3,y-3,9,0,7); ctx.fill();
+    }
+    ctx.restore();
+    // amount bar
+    const cap = this.kind==='crumbs'
+      ? (this.amount>BAL.resources.crumbs.capacity?BAL.resources.crumbs.centreCapacity:BAL.resources.crumbs.capacity)
+      : BAL.resources.twigs.capacity;
+    drawBar(x, y - this.radius - 8, 34, 3, this.amount/Math.max(cap,this.amount), '#d9a441');
+  }
+}
+
+class Building {
+  constructor(type, faction, gx, gy, prebuilt=false){
+    const def = BAL.buildings[type];
+    this.id = nextId();
+    this.type = type; this.def = def;
+    this.faction = faction;
+    this.size = def.size;
+    this.x = gx; this.y = gy;            // top-left, grid-aligned
+    this.cx = gx + def.size/2; this.cy = gy + def.size/2;
+    this.maxHp = def.hp;
+    this.hp = prebuilt ? def.hp : def.hp*0.1;
+    this.built = prebuilt;
+    this.buildProgress = prebuilt ? 1 : 0;
+    this.builder = null;                 // forager constructing
+    this.queue = null;                   // { type, remaining }
+    this.rally = null;
+  }
+  get isProduction(){ return this.def.trains.length>0; }
+  centre(){ return { x:this.cx, y:this.cy }; }
+
+  startTraining(unitType){
+    if(this.queue) return 'busy';
+    const d = BAL.units[unitType];
+    const st = G.store[this.faction];
+    if(st.c < d.cost.c || st.t < d.cost.t) return 'cost';
+    if(currentPop(this.faction) + 1 > popCap(this.faction)) return 'pop';
+    st.c -= d.cost.c; st.t -= d.cost.t;
+    this.queue = { type: unitType, total: d.train, remaining: d.train };
+    return 'ok';
+  }
+  update(dt){
+    if(!this.built){
+      // construction handled by the assigned forager via BUILDING state
+      this.buildProgress = clamp(this.buildProgress, 0, 1);
+      this.hp = this.maxHp * (0.1 + 0.9*this.buildProgress);
+      if(this.buildProgress >= 1){ this.built = true; this.hp = this.maxHp; this.builder = null; }
+      return;
+    }
+    if(this.queue){
+      this.queue.remaining -= dt;
+      if(this.queue.remaining <= 0){
+        spawnUnit(this.queue.type, this.faction, this);
+        this.queue = null;
+      }
+    }
+  }
+  draw(){
+    const x=w2sx(this.x), y=w2sy(this.y), s=this.size;
+    const t = TINT[this.faction];
+    ctx.save();
+    ctx.globalAlpha = this.built ? 1 : 0.55;
+    // base
+    ctx.fillStyle = this.faction===Faction.PIGEON ? '#3a4566' : '#34384a';
+    ctx.fillRect(x,y,s,s);
+    // nest twig border
+    ctx.strokeStyle = '#7a5a32'; ctx.lineWidth=4; ctx.strokeRect(x+2,y+2,s-4,s-4);
+    ctx.globalAlpha = 1;
+    // icon by type
+    ctx.fillStyle = t.edge; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.font = 'bold ' + Math.round(s*0.18) + 'px Trebuchet MS';
+    const label = this.type==='MainNest'?'NEST':this.type==='Birdbath'?'BATH':'BARRACKS';
+    ctx.fillText(label, x+s/2, y+s/2 - (this.isProduction?6:0));
+    // faction banner pip
+    ctx.fillStyle = this.faction===Faction.PIGEON ? '#3a72c4' : '#1f2330';
+    ctx.fillRect(x+s/2-7, y-12, 14, 14);
+    ctx.fillStyle = t.edge;
+    ctx.beginPath(); ctx.arc(x+s/2, y-5, 3.5, 0, 7); ctx.fill();
+    ctx.restore();
+
+    // construction overlay
+    if(!this.built){
+      drawBar(x+s/2, y+s+8, s*0.8, 4, this.buildProgress, '#7fd17f');
+    }
+    // training progress
+    if(this.queue){
+      const p = 1 - this.queue.remaining/this.queue.total;
+      drawBar(x+s/2, y+s+8, s*0.8, 4, p, '#d9a441');
+    }
+    // health bar
+    if(this.hp < this.maxHp || isSelected(this))
+      drawBar(x+s/2, y-20, s*0.8, 4, this.hp/this.maxHp, healthColor(this.hp/this.maxHp));
+    // selection ring
+    if(isSelected(this)){
+      ctx.strokeStyle = t.ring; ctx.lineWidth=2;
+      ctx.strokeRect(x-3,y-3,s+6,s+6);
+    }
+  }
+}
+
+class Unit {
+  constructor(type, faction, x, y){
+    const def = BAL.units[type];
+    this.id = nextId();
+    this.type = type; this.def = def;
+    this.faction = faction;
+    this.x = x; this.y = y;
+    this.r = BAL.unitRadius;
+    this.maxHp = def.hp; this.hp = def.hp;
+    this.state = UState.IDLE;
+    this.speed = def.speed;
+    this.cd = 0;                  // attack cooldown timer
+    this.move = null;             // {x,y}
+    this.target = null;           // enemy entity (unit/building)
+    this.post = { x, y };         // return-to post for combat units
+    this.aggressive = false;      // right-clicked an enemy => pursue
+    this.fade = 1;
+
+    // forager economy
+    this.carry = null;            // {kind, amount}
+    this.gatherNode = null;
+    this.gatherTimer = 0;
+    this.gatherSub = null;        // 'to','gather','return'
+    this.buildTarget = null;      // building under construction
+    this.deathTimer = 0;
+  }
+  get combat(){ return !!this.def.combat; }
+
+  /* -- orders -- */
+  orderMove(x,y){
+    this.clearJobs();
+    this.move = { x, y };
+    this.post = { x, y };
+    this.state = UState.MOVING;
+    this.aggressive = false;
+  }
+  orderAttack(enemy){
+    this.clearJobs();
+    this.target = enemy;
+    this.aggressive = true;
+    this.state = UState.ATTACKING;
+  }
+  orderGather(node){
+    if(this.type!=='Forager') return;
+    this.clearJobs();
+    this.gatherNode = node;
+    this.gatherSub = 'to';
+    this.state = UState.GATHERING;
+  }
+  orderBuild(building){
+    this.clearJobs();
+    this.buildTarget = building;
+    this.state = UState.BUILDING;
+  }
+  clearJobs(){
+    this.move=null; this.target=null; this.gatherNode=null; this.gatherSub=null;
+    this.carry=null; this.buildTarget=null; this.aggressive=false;
+  }
+
+  attackRange(){ return this.def.range + this.r; }
+
+  update(dt){
+    if(this.state===UState.DEAD){
+      this.deathTimer += dt; this.fade = clamp(1 - this.deathTimer/1, 0, 1);
+      return;
+    }
+    this.cd = Math.max(0, this.cd - dt);
+
+    // auto-acquire for combat units when idle/moving (not aggressive move)
+    if(this.combat && (this.state===UState.IDLE) && !this.target){
+      const e = acquireTarget(this, BAL.aggroRadius);
+      if(e){ this.target = e; this.aggressive = false; this.state = UState.ATTACKING; }
+    }
+
+    switch(this.state){
+      case UState.MOVING:    this.tickMove(dt); break;
+      case UState.ATTACKING: this.tickAttack(dt); break;
+      case UState.GATHERING: this.tickGather(dt); break;
+      case UState.BUILDING:  this.tickBuild(dt); break;
+    }
+  }
+
+  stepTowards(tx,ty,dt){
+    const dx=tx-this.x, dy=ty-this.y, d=len(dx,dy);
+    if(d < 1) return true;
+    const step = Math.min(d, this.speed*dt);
+    this.x += dx/d*step; this.y += dy/d*step;
+    this.x = clamp(this.x, 0, BAL.world.w); this.y = clamp(this.y, 0, BAL.world.h);
+    return d <= step + 0.5;
+  }
+
+  tickMove(dt){
+    if(!this.move){ this.state=UState.IDLE; return; }
+    if(this.stepTowards(this.move.x, this.move.y, dt)){ this.move=null; this.state=UState.IDLE; }
+  }
+
+  tickAttack(dt){
+    const e = this.target;
+    if(!e || e.state===UState.DEAD || e.hp<=0){
+      this.target=null;
+      // return to post
+      if(len(this.post.x-this.x, this.post.y-this.y) > 6){ this.move={...this.post}; this.state=UState.MOVING; }
+      else this.state=UState.IDLE;
+      return;
+    }
+    const ex = e.cx!==undefined ? e.cx : e.x;
+    const ey = e.cy!==undefined ? e.cy : e.y;
+    const er = e.size!==undefined ? e.size/2 : (e.r||0);
+    const d = len(ex-this.x, ey-this.y);
+    const reach = this.def.range + this.r + er;
+
+    // leash: non-aggressive units give up if dragged too far from post
+    if(!this.aggressive && len(this.post.x-this.x, this.post.y-this.y) > BAL.aggroRadius*BAL.chaseLeash){
+      this.target=null; this.move={...this.post}; this.state=UState.MOVING; return;
+    }
+    if(d > reach){
+      this.stepTowards(ex,ey,dt);
+    } else if(this.cd<=0){
+      // strike
+      dealDamage(e, this.def.dmg, this);
+      this.cd = this.def.cd;
+      if(this.def.ranged){
+        G.effects.push({ kind:'shot', x1:this.x, y1:this.y, x2:ex, y2:ey, t:0.18, max:0.18, faction:this.faction });
+        G.effects.push({ kind:'splat', x:ex, y:ey, t:0.35, max:0.35 });
+      }
+    }
+  }
+
+  tickGather(dt){
+    const node = this.gatherNode;
+    const nest = nearestNest(this);
+    if(this.gatherSub==='to'){
+      if(!node || node.amount<=0){ this.gatherNode=null; this.state=UState.IDLE; return; }
+      if(this.stepTowards(node.x, node.y, dt)){ this.gatherSub='gather'; this.gatherTimer=BAL.resources[node.kind].time; }
+    }
+    else if(this.gatherSub==='gather'){
+      if(!node || node.amount<=0){ this.gatherNode=null; this.state=UState.IDLE; return; }
+      this.gatherTimer -= dt;
+      if(this.gatherTimer<=0){
+        const carryAmt = Math.min(BAL.resources[node.kind].carry, node.amount);
+        node.amount -= carryAmt;
+        this.carry = { kind: node.kind, amount: carryAmt };
+        if(node.amount<=0) removeNode(node);
+        this.gatherSub='return';
+      }
+    }
+    else if(this.gatherSub==='return'){
+      if(!nest){ this.state=UState.IDLE; return; }              // no drop-off, idle
+      if(this.stepTowards(nest.cx, nest.cy, dt)){
+        if(this.carry){
+          G.store[this.faction][this.carry.kind==='crumbs'?'c':'t'] += this.carry.amount;
+          this.carry=null;
+        }
+        if(node && node.amount>0){ this.gatherSub='to'; }
+        else { this.gatherNode=null; this.state=UState.IDLE; }
+      }
+    }
+  }
+
+  tickBuild(dt){
+    const b = this.buildTarget;
+    if(!b || b.built){ this.buildTarget=null; this.state=UState.IDLE; return; }
+    const reach = b.size/2 + this.r + 8;
+    if(len(b.cx-this.x, b.cy-this.y) > reach){ this.stepTowards(b.cx, b.cy, dt); return; }
+    b.builder = this;
+    b.buildProgress += dt / b.def.build;
+    if(b.buildProgress >= 1){ this.buildTarget=null; this.state=UState.IDLE; }
+  }
+
+  draw(){
+    const x=w2sx(this.x), y=w2sy(this.y), r=this.r;
+    const t = TINT[this.faction];
+    ctx.save();
+    ctx.globalAlpha = this.fade;
+    // body
+    ctx.fillStyle = t.body;
+    ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = t.edge; ctx.stroke();
+    // role marker
+    ctx.fillStyle = t.edge; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.font = 'bold 11px Trebuchet MS';
+    const m = this.type==='Forager'?'F':this.type==='Pecker'?'P':'B';
+    ctx.fillText(m, x, y);
+    // carrying indicator
+    if(this.carry){
+      ctx.fillStyle = this.carry.kind==='crumbs'?'#e8c878':'#7a5a32';
+      ctx.beginPath(); ctx.arc(x, y-r-3, 3, 0, 7); ctx.fill();
+    }
+    ctx.restore();
+
+    // health bar
+    if(this.hp < this.maxHp || isSelected(this))
+      drawBar(x, y-r-9, 26, 3, this.hp/this.maxHp, healthColor(this.hp/this.maxHp));
+    // selection ring
+    if(isSelected(this)){
+      ctx.strokeStyle = t.ring; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(x,y,r+4,0,7); ctx.stroke();
+    }
+  }
+}
+
+/* ============================================================
+   Spawning / helpers
+   ============================================================ */
+function spawnUnit(type, faction, building){
+  // spawn at nearest free edge of the building, step clear
+  const ang = Math.random()*Math.PI*2;
+  const off = building.size/2 + BAL.unitRadius + 6;
+  let sx = building.cx + Math.cos(ang)*off;
+  let sy = building.cy + Math.sin(ang)*off;
+  sx = clamp(sx, 0, BAL.world.w); sy = clamp(sy, 0, BAL.world.h);
+  const u = new Unit(type, faction, sx, sy);
+  if(building.rally){ u.orderMove(building.rally.x, building.rally.y); }
+  G.units.push(u);
+  return u;
+}
+
+function nearestNest(unit){
+  let best=null, bd=Infinity;
+  for(const b of G.buildings){
+    if(b.faction!==unit.faction || b.type!=='MainNest' || !b.built) continue;
+    const d = len(b.cx-unit.x, b.cy-unit.y);
+    if(d<bd){ bd=d; best=b; }
+  }
+  return best;
+}
+
+function acquireTarget(unit, radius){
+  let best=null, bd=radius;
+  for(const e of G.units){
+    if(e.faction===unit.faction || e.state===UState.DEAD) continue;
+    const d = len(e.x-unit.x, e.y-unit.y);
+    if(d<bd){ bd=d; best=e; }
+  }
+  // also buildings if nothing closer
+  if(!best){
+    for(const b of G.buildings){
+      if(b.faction===unit.faction) continue;
+      const d = len(b.cx-unit.x, b.cy-unit.y);
+      if(d<bd){ bd=d; best=b; }
+    }
+  }
+  return best;
+}
+
+function dealDamage(target, amount){
+  if(target.state===UState.DEAD) return;
+  target.hp -= amount;
+  if(target.hp<=0){
+    target.hp=0;
+    if(target instanceof Unit){ target.state=UState.DEAD; target.deathTimer=0; }
+    else { target._dead = true; }
+  }
+}
+
+function removeNode(node){
+  const i = G.nodes.indexOf(node);
+  if(i>=0) G.nodes.splice(i,1);
+  // free up foragers locked onto it
+  for(const u of G.units) if(u.gatherNode===node){ u.gatherNode=null; if(!u.carry){ u.state=UState.IDLE; } }
+}
+
+function currentPop(faction){ return G.units.filter(u=>u.faction===faction && u.state!==UState.DEAD).length; }
+function popCap(faction){
+  let cap=0;
+  for(const b of G.buildings) if(b.faction===faction && b.built) cap += b.def.pop;
+  return Math.min(cap, BAL.popCap);
+}
+
+function isSelected(e){ return G.selection.includes(e); }
+function healthColor(f){ return f>0.5?'#7fd17f':(f>0.25?'#d9a441':'#e07070'); }
+function drawBar(cx, y, w, h, frac, color){
+  frac = clamp(frac,0,1);
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(cx-w/2-1, y-1, w+2, h+2);
+  ctx.fillStyle = '#222'; ctx.fillRect(cx-w/2, y, w, h);
+  ctx.fillStyle = color; ctx.fillRect(cx-w/2, y, w*frac, h);
+}
+
+/* ============================================================
+   World setup (symmetric skirmish map)
+   ============================================================ */
+function setupWorld(){
+  G.units.length=0; G.buildings.length=0; G.nodes.length=0; G.effects.length=0; G.selection.length=0;
+  G.store.pigeon = { c: BAL.startStockpile.crumbs, t: BAL.startStockpile.twigs };
+  G.store.magpie = { c: BAL.startStockpile.crumbs, t: BAL.startStockpile.twigs };
+  G.t=0; G.over=null; G.placement=null;
+  AI.reset();
+
+  // snap helper for building top-left to grid
+  const snap = v => Math.round(v/BAL.world.grid)*BAL.world.grid;
+  const place = (type, fac, cx, cy, prebuilt) => {
+    const def = BAL.buildings[type];
+    const b = new Building(type, fac, snap(cx-def.size/2), snap(cy-def.size/2), prebuilt);
+    G.buildings.push(b); return b;
+  };
+
+  // --- Player (Pigeons) base bottom-left ---
+  place('MainNest', Faction.PIGEON, 300, 1700, true);
+  G.nodes.push(new ResourceNode('crumbs', 550, 1700, BAL.resources.crumbs.capacity));
+  G.nodes.push(new ResourceNode('twigs', 180, 1500, BAL.resources.twigs.capacity));
+  G.nodes.push(new ResourceNode('twigs', 480, 1480, BAL.resources.twigs.capacity));
+  for(let i=0;i<3;i++) spawnUnit('Forager', Faction.PIGEON, G.buildings[0]);
+
+  // --- Magpie base top-right ---
+  place('MainNest', Faction.MAGPIE, 1700, 300, true);
+  G.nodes.push(new ResourceNode('crumbs', 1450, 300, BAL.resources.crumbs.capacity));
+  G.nodes.push(new ResourceNode('twigs', 1820, 500, BAL.resources.twigs.capacity));
+  G.nodes.push(new ResourceNode('twigs', 1520, 520, BAL.resources.twigs.capacity));
+  for(let i=0;i<3;i++) spawnUnit('Forager', Faction.MAGPIE, G.buildings[1]);
+
+  // --- contested centre blanket (richer) ---
+  G.nodes.push(new ResourceNode('crumbs', 1000, 1000, BAL.resources.crumbs.centreCapacity));
+
+  // start player foragers gathering nearby crumbs
+  const startCrumb = G.nodes[0];
+  for(const u of G.units) if(u.faction===Faction.PIGEON && u.type==='Forager') u.orderGather(startCrumb);
+
+  // centre camera on player base
+  G.cam.x = 300 - G.cam.vw/2; G.cam.y = 1600 - G.cam.vh/2; clampCam();
+}
+
+/* ============================================================
+   AISystem — Magpie controller (§7)
+   ============================================================ */
+const AI = {
+  fac: Faction.MAGPIE,
+  state: {},
+  reset(){ this.state = { trickle:0, buildIdx:0, retargetTimer:0 }; },
+
+  tick(dt){
+    if(G.over) return;
+    const s = this.state;
+    const myBuildings = G.buildings.filter(b=>b.faction===this.fac);
+    const nest = myBuildings.find(b=>b.type==='MainNest' && b.built);
+    if(!nest) return;
+
+    // light cheat: small resource trickle so the AI keeps pressure without smart economy
+    s.trickle += dt;
+    if(s.trickle>=1){ s.trickle-=1; G.store.magpie.c += BAL.ai.trickle.c; G.store.magpie.t += BAL.ai.trickle.t; }
+
+    const myUnits = G.units.filter(u=>u.faction===this.fac && u.state!==UState.DEAD);
+    const foragers = myUnits.filter(u=>u.type==='Forager');
+    const fighters = myUnits.filter(u=>u.combat);
+
+    // 1. Economy: keep workerTarget foragers gathering
+    if(foragers.length < BAL.ai.workerTarget && !nest.queue){
+      nest.startTraining('Forager');
+    }
+    // assign idle foragers to nearest non-empty node
+    for(const f of foragers){
+      if(f.state===UState.IDLE){
+        const node = this.nearestNode(f);
+        if(node) f.orderGather(node);
+      }
+    }
+
+    // 2. Build order: Birdbath -> Branch Barracks
+    const haveBath = myBuildings.some(b=>b.type==='Birdbath');
+    const haveBar  = myBuildings.some(b=>b.type==='BranchBarracks');
+    if(!haveBath){ this.tryBuild('Birdbath', nest, foragers); }
+    else if(!haveBar){ this.tryBuild('BranchBarracks', nest, foragers); }
+    else {
+      // 3. Train combat units continuously, alternate, up to squad
+      const bar = myBuildings.find(b=>b.type==='BranchBarracks' && b.built);
+      if(bar && !bar.queue && fighters.length < BAL.ai.squadSize){
+        const next = (fighters.filter(u=>u.type==='Pecker').length <= fighters.filter(u=>u.type==='PoopBomber').length)
+          ? 'Pecker' : 'PoopBomber';
+        bar.startTraining(next);
+      }
+    }
+
+    // 4. Attack waves: when squad full and past first-wave gate, attack-move at player nest
+    const idleFighters = fighters.filter(u=> !u.aggressive && (u.state===UState.IDLE || u.state===UState.MOVING));
+    if(fighters.length >= BAL.ai.squadSize && G.t >= BAL.ai.firstWaveAt){
+      const target = G.buildings.find(b=>b.faction===Faction.PIGEON && b.type==='MainNest') ||
+                     G.buildings.find(b=>b.faction===Faction.PIGEON);
+      if(target){ for(const f of fighters){ f.orderAttack(target); } }
+    } else {
+      // 5. Defence: fighters near a building auto-engage (handled by aggro), keep idle ones home
+      for(const f of idleFighters){
+        if(len(f.x-nest.cx, f.y-nest.cy) > BAL.defenceRadius*1.2 && !f.target){
+          f.orderMove(nest.cx + (Math.random()*120-60), nest.cy + (Math.random()*120-60));
+        }
+      }
+    }
+  },
+
+  nearestNode(u){
+    let best=null,bd=Infinity;
+    for(const n of G.nodes){ if(n.amount<=0) continue; const d=len(n.x-u.x,n.y-u.y); if(d<bd){bd=d;best=n;} }
+    return best;
+  },
+
+  tryBuild(type, nest, foragers){
+    if(G.buildings.some(b=>b.faction===this.fac && b.type===type)) return;
+    const def = BAL.buildings[type];
+    const st = G.store.magpie;
+    if(st.c < def.cost.c || st.t < def.cost.t) return;
+    // find a free forager (idle or gathering)
+    const builder = foragers.find(f=>f.state!==UState.BUILDING);
+    if(!builder) return;
+    // place near nest on grid, not overlapping
+    const snap = v=>Math.round(v/BAL.world.grid)*BAL.world.grid;
+    for(let r=120;r<400;r+=50){
+      for(let a=0;a<Math.PI*2;a+=0.6){
+        const gx = snap(nest.cx + Math.cos(a)*r - def.size/2);
+        const gy = snap(nest.cy + Math.sin(a)*r - def.size/2);
+        if(canPlace(type, gx, gy, null)){
+          st.c -= def.cost.c; st.t -= def.cost.t;
+          const b = new Building(type, this.fac, gx, gy, false);
+          G.buildings.push(b);
+          builder.orderBuild(b);
+          return;
+        }
+      }
+    }
+  },
+};
+
+/* ============================================================
+   Placement validity
+   ============================================================ */
+function canPlace(type, gx, gy, ignore){
+  const def = BAL.buildings[type];
+  if(gx<0 || gy<0 || gx+def.size>BAL.world.w || gy+def.size>BAL.world.h) return false;
+  // overlap buildings
+  for(const b of G.buildings){
+    if(b===ignore) continue;
+    if(gx < b.x+b.size && gx+def.size > b.x && gy < b.y+b.size && gy+def.size > b.y) return false;
+  }
+  // overlap nodes
+  for(const n of G.nodes){
+    const nx=n.x-n.radius, ny=n.y-n.radius, ns=n.radius*2;
+    if(gx < nx+ns && gx+def.size > nx && gy < ny+ns && gy+def.size > ny) return false;
+  }
+  return true;
+}
+
+/* ============================================================
+   InputSystem
+   ============================================================ */
+const keys = {};
+const mouse = { sx:0, sy:0, down:false, button:0, dragStart:null, dragging:false };
+
+window.addEventListener('keydown', e=>{
+  keys[e.key.toLowerCase()] = true;
+  if(e.key==='Escape'){ G.placement=null; G.selection.length=0; }
+});
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+canvas.addEventListener('mousemove', e=>{
+  const rect = canvas.getBoundingClientRect();
+  mouse.sx = e.clientX-rect.left; mouse.sy = e.clientY-rect.top;
+  if(mouse.down && mouse.button===0 && mouse.dragStart){
+    if(len(mouse.sx-mouse.dragStart.sx, mouse.sy-mouse.dragStart.sy) > 6) mouse.dragging=true;
+  }
+});
+
+canvas.addEventListener('mousedown', e=>{
+  const rect = canvas.getBoundingClientRect();
+  mouse.sx=e.clientX-rect.left; mouse.sy=e.clientY-rect.top;
+  mouse.down=true; mouse.button=e.button;
+
+  if(!G.running || G.over) return;
+
+  // HUD first (buttons live at screen-space bottom panel)
+  if(e.button===0 && hudClick(mouse.sx, mouse.sy)) return;
+
+  if(e.button===0){
+    if(G.placement){ tryPlaceBuilding(); return; }
+    mouse.dragStart = { sx:mouse.sx, sy:mouse.sy, wx:s2wx(mouse.sx), wy:s2wy(mouse.sy) };
+    mouse.dragging=false;
+  } else if(e.button===2){
+    if(G.placement){ G.placement=null; return; }
+    rightClickCommand(s2wx(mouse.sx), s2wy(mouse.sy));
+  }
+});
+
+window.addEventListener('mouseup', e=>{
+  if(e.button===0 && mouse.down && mouse.button===0){
+    if(mouse.dragStart){
+      if(mouse.dragging) boxSelect(mouse.dragStart, { sx:mouse.sx, sy:mouse.sy });
+      else clickSelect(s2wx(mouse.sx), s2wy(mouse.sy));
+    }
+  }
+  mouse.down=false; mouse.dragStart=null; mouse.dragging=false;
+});
+
+function entityAt(wx,wy){
+  // units first
+  for(let i=G.units.length-1;i>=0;i--){ const u=G.units[i]; if(u.state===UState.DEAD) continue;
+    if(len(u.x-wx,u.y-wy) <= u.r+3) return u; }
+  for(let i=G.buildings.length-1;i>=0;i--){ const b=G.buildings[i];
+    if(wx>=b.x && wx<=b.x+b.size && wy>=b.y && wy<=b.y+b.size) return b; }
+  for(let i=G.nodes.length-1;i>=0;i--){ const n=G.nodes[i];
+    if(len(n.x-wx,n.y-wy) <= n.radius+4) return n; }
+  return null;
+}
+
+function clickSelect(wx,wy){
+  const ent = entityAt(wx,wy);
+  const add = keys['shift'];
+  if(!ent){ if(!add) G.selection.length=0; return; }
+  if(ent instanceof ResourceNode){ if(!add) G.selection.length=0; return; }
+  // only own entities are command-selectable; enemy single-select allowed for inspection
+  if(add && (ent instanceof Unit) && ent.faction===Faction.PIGEON){
+    const i=G.selection.indexOf(ent); if(i>=0) G.selection.splice(i,1); else G.selection.push(ent);
+  } else {
+    G.selection.length=0; G.selection.push(ent);
+  }
+}
+
+function boxSelect(a,b){
+  const x1=Math.min(a.sx,b.sx), x2=Math.max(a.sx,b.sx);
+  const y1=Math.min(a.sy,b.sy), y2=Math.max(a.sy,b.sy);
+  if(!keys['shift']) G.selection.length=0;
+  // box selects own units only (buildings excluded)
+  for(const u of G.units){
+    if(u.faction!==Faction.PIGEON || u.state===UState.DEAD) continue;
+    const sx=w2sx(u.x), sy=w2sy(u.y);
+    if(sx>=x1 && sx<=x2 && sy>=y1 && sy<=y2 && !G.selection.includes(u)) G.selection.push(u);
+  }
+}
+
+function rightClickCommand(wx,wy){
+  const own = G.selection.filter(s=> s instanceof Unit && s.faction===Faction.PIGEON);
+  if(own.length===0) return;
+  const ent = entityAt(wx,wy);
+
+  if(ent instanceof Unit && ent.faction!==Faction.PIGEON){
+    for(const u of own) if(u.combat) u.orderAttack(ent);
+    return;
+  }
+  if(ent instanceof Building && ent.faction!==Faction.PIGEON){
+    for(const u of own) if(u.combat) u.orderAttack(ent);
+    return;
+  }
+  if(ent instanceof ResourceNode){
+    let any=false;
+    for(const u of own) if(u.type==='Forager'){ u.orderGather(ent); any=true; }
+    if(any) return;
+  }
+  if(ent instanceof Building && ent.faction===Faction.PIGEON && !ent.built){
+    for(const u of own) if(u.type==='Forager') u.orderBuild(ent);
+    return;
+  }
+  // plain move with cluster offsets
+  const n = own.length, cols = Math.ceil(Math.sqrt(n)), spacing=30;
+  own.forEach((u,i)=>{
+    const ox=(i%cols - (cols-1)/2)*spacing, oy=(Math.floor(i/cols) - (Math.ceil(n/cols)-1)/2)*spacing;
+    u.orderMove(wx+ox, wy+oy);
+  });
+}
+
+/* ----- building placement ----- */
+function startPlacement(type){
+  const builder = G.selection.find(s=> s instanceof Unit && s.type==='Forager' && s.faction===Faction.PIGEON);
+  if(!builder) return;
+  const def = BAL.buildings[type], st=G.store.pigeon;
+  if(st.c < def.cost.c || st.t < def.cost.t) return;
+  G.placement = { type, builder };
+}
+function tryPlaceBuilding(){
+  const p = G.placement; if(!p) return;
+  const def = BAL.buildings[p.type];
+  const snap = v=>Math.round(v/BAL.world.grid)*BAL.world.grid;
+  const gx = snap(s2wx(mouse.sx)-def.size/2), gy = snap(s2wy(mouse.sy)-def.size/2);
+  if(!canPlace(p.type, gx, gy, null)) return;
+  const st = G.store.pigeon;
+  if(st.c < def.cost.c || st.t < def.cost.t){ G.placement=null; return; }
+  st.c -= def.cost.c; st.t -= def.cost.t;
+  const b = new Building(p.type, Faction.PIGEON, gx, gy, false);
+  G.buildings.push(b);
+  if(p.builder && p.builder.state!==UState.DEAD) p.builder.orderBuild(b);
+  if(!keys['shift']) G.placement=null;   // shift to keep placing
+}
+
+/* ============================================================
+   HUD — top bar + bottom command panel (screen-space)
+   ============================================================ */
+const HUD = { buttons: [] };
+
+function drawHUD(){
+  const W=canvas.width, H=canvas.height;
+  // top bar
+  ctx.fillStyle='rgba(18,20,28,0.92)'; ctx.fillRect(0,0,W,40);
+  ctx.strokeStyle='#3a4258'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,40); ctx.lineTo(W,40); ctx.stroke();
+  const st=G.store.pigeon;
+  ctx.textBaseline='middle'; ctx.font='bold 16px Trebuchet MS'; ctx.textAlign='left';
+  ctx.fillStyle='#e8c878'; ctx.fillText('🍞 '+Math.floor(st.c), 16, 20);
+  ctx.fillStyle='#b08d57'; ctx.fillText('🪵 '+Math.floor(st.t), 150, 20);
+  const pop=currentPop(Faction.PIGEON), cap=popCap(Faction.PIGEON);
+  ctx.fillStyle = pop>=cap ? '#e07070' : '#9ad1ff'; ctx.fillText('🪶 '+pop+'/'+cap, 270, 20);
+  ctx.fillStyle='#7f8696'; ctx.textAlign='right';
+  ctx.fillText('Magpie nests: '+G.buildings.filter(b=>b.faction===Faction.MAGPIE).length+'   |   '+fmtTime(G.t), W-16, 20);
+
+  // bottom panel
+  const ph=120, py=H-ph;
+  ctx.fillStyle='rgba(18,20,28,0.94)'; ctx.fillRect(0,py,W,ph);
+  ctx.strokeStyle='#3a4258'; ctx.beginPath(); ctx.moveTo(0,py); ctx.lineTo(W,py); ctx.stroke();
+
+  HUD.buttons=[];
+  const sel=G.selection;
+  // portrait / name
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  if(sel.length===0){
+    ctx.fillStyle='#6b7180'; ctx.font='14px Trebuchet MS';
+    ctx.fillText('Nothing selected. Select a Forager to build, a Nest/Barracks to train.', 20, py+18);
+  } else if(sel.length===1){
+    const e=sel[0];
+    ctx.fillStyle='#cdd6f4'; ctx.font='bold 18px Trebuchet MS';
+    ctx.fillText(displayName(e), 20, py+14);
+    ctx.fillStyle='#9aa0b0'; ctx.font='13px Trebuchet MS';
+    if(e instanceof Unit) ctx.fillText('HP '+Math.ceil(e.hp)+'/'+e.maxHp+'   ·   '+e.state, 20, py+40);
+    if(e instanceof Building){
+      ctx.fillText('HP '+Math.ceil(e.hp)+'/'+e.maxHp+(e.built?'':'   ·   building '+Math.floor(e.buildProgress*100)+'%'), 20, py+40);
+      if(e.queue) ctx.fillText('Training '+prettyType(e.queue.type)+'  ('+Math.ceil(e.queue.remaining)+'s)', 20, py+60);
+    }
+  } else {
+    ctx.fillStyle='#cdd6f4'; ctx.font='bold 18px Trebuchet MS';
+    ctx.fillText(sel.length+' units', 20, py+14);
+  }
+
+  // command buttons
+  let bx=300, by=py+22, bw=150, bh=34, gap=10;
+  const addBtn=(label, sub, enabled, action, tip)=>{
+    HUD.buttons.push({ x:bx, y:by, w:bw, h:bh, action, enabled, tip });
+    ctx.fillStyle = enabled ? '#2d3a52' : '#22262f';
+    ctx.fillRect(bx,by,bw,bh);
+    ctx.strokeStyle = enabled ? '#4d6ea8' : '#33384a'; ctx.strokeRect(bx,by,bw,bh);
+    ctx.fillStyle = enabled ? '#e8e4d8' : '#5a6070';
+    ctx.font='bold 13px Trebuchet MS'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(label, bx+bw/2, by+(sub?bh/2-7:bh/2));
+    if(sub){ ctx.font='11px Trebuchet MS'; ctx.fillStyle=enabled?'#9 ad1ff':'#4a5060';
+      ctx.fillStyle = enabled?'#9ad1ff':'#4a5060'; ctx.fillText(sub, bx+bw/2, by+bh/2+8); }
+    bx += bw+gap;
+    if(bx+bw > canvas.width-20){ bx=300; by+=bh+8; }
+  };
+
+  const own = sel.filter(s=> (s instanceof Unit||s instanceof Building) && s.faction===Faction.PIGEON);
+  const oneB = (sel.length===1 && sel[0] instanceof Building && sel[0].faction===Faction.PIGEON && sel[0].built) ? sel[0] : null;
+  const hasForager = own.some(s=> s instanceof Unit && s.type==='Forager');
+
+  if(oneB && oneB.isProduction){
+    for(const t of oneB.def.trains){
+      const d=BAL.units[t], st2=G.store.pigeon;
+      const afford = st2.c>=d.cost.c && st2.t>=d.cost.t && currentPop(Faction.PIGEON)+1<=popCap(Faction.PIGEON) && !oneB.queue;
+      addBtn('Train '+prettyType(t), costStr(d.cost)+'  '+d.train+'s', afford, ()=>oneB.startTraining(t));
+    }
+  } else if(hasForager){
+    for(const bt of ['MainNest','Birdbath','BranchBarracks']){
+      const d=BAL.buildings[bt], st2=G.store.pigeon;
+      const afford = st2.c>=d.cost.c && st2.t>=d.cost.t;
+      addBtn('Build '+prettyType(bt), costStr(d.cost), afford && !G.placement, ()=>startPlacement(bt));
+    }
+  }
+}
+
+function hudClick(sx,sy){
+  // any click in top bar or bottom panel consumed
+  const inTop = sy<40, inBottom = sy>canvas.height-120;
+  for(const b of HUD.buttons){
+    if(sx>=b.x && sx<=b.x+b.w && sy>=b.y && sy<=b.y+b.h){ if(b.enabled) b.action(); return true; }
+  }
+  return inTop || inBottom;
+}
+
+const TYPE_NAMES = { Forager:'Forager', Pecker:'Pecker', PoopBomber:'Poop-Bomber', MainNest:'Main Nest', Birdbath:'Birdbath', BranchBarracks:'Branch Barracks' };
+const prettyType = t => TYPE_NAMES[t]||t;
+function displayName(e){
+  if(e instanceof Unit) return (e.faction===Faction.MAGPIE?'Enemy ':'')+prettyType(e.type);
+  if(e instanceof Building) return (e.faction===Faction.MAGPIE?'Enemy ':'')+prettyType(e.type);
+  return e.kind==='crumbs'?'Picnic Blanket':'Bush';
+}
+const costStr = c => (c.c?('🍞'+c.c+' '):'')+(c.t?('🪵'+c.t):'')||'free';
+function fmtTime(s){ const m=Math.floor(s/60), sec=Math.floor(s%60); return m+':'+(sec<10?'0':'')+sec; }
+
+/* ============================================================
+   Systems wiring + main loop
+   ============================================================ */
+function update(dt){
+  if(G.over) return;
+  G.t += dt;
+
+  // camera (MovementSystem-adjacent: input-driven pan)
+  let cdx=0, cdy=0;
+  if(keys['a']||keys['arrowleft']) cdx-=1;
+  if(keys['d']||keys['arrowright']) cdx+=1;
+  if(keys['w']||keys['arrowup']) cdy-=1;
+  if(keys['s']||keys['arrowdown']) cdy+=1;
+  if(mouse.sx<BAL.camera.edge) cdx-=1; else if(mouse.sx>canvas.width-BAL.camera.edge) cdx+=1;
+  if(mouse.sy<BAL.camera.edge) cdy-=1; else if(mouse.sy>canvas.height-BAL.camera.edge) cdy+=1;
+  if(cdx||cdy){ const m=BAL.camera.speed*dt/(Math.hypot(cdx,cdy)||1); G.cam.x+=cdx*m; G.cam.y+=cdy*m; clampCam(); }
+
+  // entity updates
+  for(const u of G.units) u.update(dt);
+  for(const b of G.buildings) b.update(dt);
+
+  // MovementSystem: separation pushes (collision radius)
+  separation();
+
+  // AISystem
+  AI.tick(dt);
+
+  // cull dead units
+  for(let i=G.units.length-1;i>=0;i--){
+    const u=G.units[i];
+    if(u.state===UState.DEAD && u.fade<=0){ const s=G.selection.indexOf(u); if(s>=0)G.selection.splice(s,1); G.units.splice(i,1); }
+  }
+  // cull dead buildings
+  for(let i=G.buildings.length-1;i>=0;i--){
+    if(G.buildings[i]._dead){ const b=G.buildings[i]; const s=G.selection.indexOf(b); if(s>=0)G.selection.splice(s,1); G.buildings.splice(i,1); }
+  }
+  // effects
+  for(let i=G.effects.length-1;i>=0;i--){ G.effects[i].t-=dt; if(G.effects[i].t<=0) G.effects.splice(i,1); }
+
+  // win / lose (CombatSystem outcome)
+  const pigeonB = G.buildings.filter(b=>b.faction===Faction.PIGEON).length;
+  const magpieB = G.buildings.filter(b=>b.faction===Faction.MAGPIE).length;
+  if(magpieB===0) endGame('win');
+  else if(pigeonB===0) endGame('lose');
+}
+
+function separation(){
+  const arr=G.units;
+  for(let i=0;i<arr.length;i++){
+    const a=arr[i]; if(a.state===UState.DEAD) continue;
+    for(let j=i+1;j<arr.length;j++){
+      const b=arr[j]; if(b.state===UState.DEAD) continue;
+      const dx=b.x-a.x, dy=b.y-a.y; let d=Math.hypot(dx,dy);
+      const min=a.r+b.r;
+      if(d>0 && d<min){
+        const push=(min-d)/2, nx=dx/d, ny=dy/d;
+        a.x-=nx*push; a.y-=ny*push; b.x+=nx*push; b.y+=ny*push;
+      }
+    }
+  }
+}
+
+function endGame(result){
+  G.over=result; G.running=false;
+  const ov=document.getElementById('overlay');
+  ov.querySelector('.panel').innerHTML =
+    '<div class="result '+(result==='win'?'win':'lose')+'">'+(result==='win'?'Victory!':'Defeat')+'</div>'+
+    '<p>'+(result==='win'?'The Magpies are routed. The park is yours, mate.':'Your nests have fallen. The Magpies rule the park.')+'</p>'+
+    '<button id="startBtn">Play again</button>';
+  ov.style.display='flex';
+  ov.querySelector('#startBtn').onclick=startGame;
+}
+
+/* ---------------------- render ---------------------- */
+function render(){
+  const W=canvas.width, H=canvas.height;
+  // ground
+  ctx.fillStyle='#5f6b42'; ctx.fillRect(0,0,W,H);
+  // grass texture grid
+  ctx.strokeStyle='rgba(0,0,0,0.06)'; ctx.lineWidth=1;
+  const gs=BAL.world.grid;
+  const ox=-(G.cam.x%gs), oy=-(G.cam.y%gs);
+  ctx.beginPath();
+  for(let x=ox;x<W;x+=gs){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+  for(let y=oy;y<H;y+=gs){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+
+  // world edges
+  ctx.strokeStyle='#3a3f28'; ctx.lineWidth=4;
+  ctx.strokeRect(w2sx(0), w2sy(0), BAL.world.w, BAL.world.h);
+
+  // draw order: nodes, buildings, units, effects
+  for(const n of G.nodes) n.draw();
+  for(const b of G.buildings) b.draw();
+  for(const u of G.units) if(u.state===UState.DEAD) u.draw();
+  for(const u of G.units) if(u.state!==UState.DEAD) u.draw();
+
+  // effects
+  for(const e of G.effects){
+    if(e.kind==='shot'){
+      ctx.strokeStyle = 'rgba(220,220,180,'+(e.t/e.max)+')'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(w2sx(e.x1),w2sy(e.y1)); ctx.lineTo(w2sx(e.x2),w2sy(e.y2)); ctx.stroke();
+    } else if(e.kind==='splat'){
+      ctx.fillStyle='rgba(230,230,235,'+(e.t/e.max*0.7)+')';
+      ctx.beginPath(); ctx.arc(w2sx(e.x),w2sy(e.y), 6*(1+(1-e.t/e.max)), 0, 7); ctx.fill();
+    }
+  }
+
+  // placement ghost
+  if(G.placement){
+    const def=BAL.buildings[G.placement.type];
+    const snap=v=>Math.round(v/BAL.world.grid)*BAL.world.grid;
+    const gx=snap(s2wx(mouse.sx)-def.size/2), gy=snap(s2wy(mouse.sy)-def.size/2);
+    const ok=canPlace(G.placement.type,gx,gy,null) &&
+      G.store.pigeon.c>=def.cost.c && G.store.pigeon.t>=def.cost.t;
+    ctx.fillStyle = ok ? 'rgba(120,220,120,0.35)' : 'rgba(220,90,90,0.35)';
+    ctx.fillRect(w2sx(gx), w2sy(gy), def.size, def.size);
+    ctx.strokeStyle = ok ? '#7fd17f' : '#e07070'; ctx.lineWidth=2;
+    ctx.strokeRect(w2sx(gx), w2sy(gy), def.size, def.size);
+  }
+
+  // selection box
+  if(mouse.dragging && mouse.dragStart){
+    const x=Math.min(mouse.dragStart.sx,mouse.sx), y=Math.min(mouse.dragStart.sy,mouse.sy);
+    const w=Math.abs(mouse.sx-mouse.dragStart.sx), h=Math.abs(mouse.sy-mouse.dragStart.sy);
+    ctx.strokeStyle='#7fd1ff'; ctx.lineWidth=1.5; ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle='rgba(127,209,255,0.10)'; ctx.fillRect(x,y,w,h);
+  }
+
+  drawHUD();
+}
+
+let last=0;
+function loop(ts){
+  const dt = Math.min(0.05, (ts-last)/1000)||0; last=ts;
+  if(G.running) update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+/* ---------------------- boot ---------------------- */
+function startGame(){
+  resize();
+  setupWorld();
+  G.running=true; G.over=null;
+  document.getElementById('overlay').style.display='none';
+}
+document.getElementById('startBtn').onclick=startGame;
+resize();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
