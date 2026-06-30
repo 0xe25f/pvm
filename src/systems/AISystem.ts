@@ -1,7 +1,8 @@
 // Oi mate! This is a coo!
-import { AI } from '../config/balance';
-import type { UnitKind } from '../types';
+import { AI, BUILDING_CONFIG } from '../config/balance';
+import type { BuildingKind, UnitKind } from '../types';
 import type { Building } from '../entities/Building';
+import type { Unit } from '../entities/Unit';
 import type { LevelScene } from '../scenes/LevelScene';
 
 export class AISystem {
@@ -20,12 +21,71 @@ export class AISystem {
     this.elapsed += deltaSeconds;
     this.trainElapsed += deltaSeconds;
 
+    // CHEAT (per spec §7): the Magpie AI gets a flat resource trickle on top of what its
+    // Foragers gather, so it can keep building/training without a clever economy. This is
+    // the deliberate "AI cheats lightly rather than gaining complexity" allowance.
     this.level.resources.magpie.crumbs += AI.resourceTrickle.crumbs * deltaSeconds;
     this.level.resources.magpie.twigs += AI.resourceTrickle.twigs * deltaSeconds;
 
     this.keepWorkersGathering();
+    this.maintainBase();
     this.keepTraining();
     this.launchWaveWhenReady();
+  }
+
+  // Rebuilds missing economy/production buildings in the spec §7 build order
+  // (Birdbath → Branch Barracks). Without this, destroying the Magpie Barracks would
+  // permanently stop its combat-unit production — an easy way to neutralise the opponent.
+  // The Main Nest is intentionally NOT rebuilt: per spec, losing it collapses the economy.
+  private maintainBase(): void {
+    const nest = this.level.findPrimaryBuilding('magpie');
+    if (!nest || nest.kind !== 'mainNest') {
+      return;
+    }
+
+    const kind = this.nextBuildingToConstruct();
+    if (!kind) {
+      return;
+    }
+
+    const cost = BUILDING_CONFIG[kind].cost;
+    if (this.level.resources.magpie.crumbs < cost.crumbs || this.level.resources.magpie.twigs < cost.twigs) {
+      return;
+    }
+
+    const builder = this.pickBuilder();
+    if (!builder) {
+      return;
+    }
+
+    const spot = this.level.findBuildPlacement(kind, nest.position);
+    if (!spot) {
+      return;
+    }
+
+    this.level.startConstruction('magpie', kind, builder, spot);
+  }
+
+  private nextBuildingToConstruct(): BuildingKind | undefined {
+    const has = (kind: BuildingKind): boolean =>
+      this.level.buildings.some(
+        (building) => building.alive && building.faction === 'magpie' && building.kind === kind
+      );
+
+    if (!has('birdbath')) {
+      return 'birdbath';
+    }
+    if (!has('branchBarracks')) {
+      return 'branchBarracks';
+    }
+    return undefined;
+  }
+
+  private pickBuilder(): Unit | undefined {
+    const foragers = this.level.units.filter(
+      (unit) => unit.alive && unit.faction === 'magpie' && unit.kind === 'forager' && unit.state !== 'building'
+    );
+    return foragers[0];
   }
 
   private keepWorkersGathering(): void {

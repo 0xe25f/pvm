@@ -23,6 +23,8 @@ export class Unit extends Entity {
     amount: number;
   };
   homePost: Point;
+  private attackOrdered = false;
+  private buildingActive = false;
   private gatherElapsed = 0;
   private attackElapsed = 0;
   private sprite: Phaser.GameObjects.Image;
@@ -77,11 +79,14 @@ export class Unit extends Entity {
     this.gatherElapsed = 0;
   }
 
-  attack(target: AttackTarget): void {
+  // `ordered` distinguishes an explicit player/AI attack command (chase the target wherever
+  // it goes) from an auto-acquired target picked up while idle (which leashes back to post).
+  attack(target: AttackTarget, ordered = true): void {
     if (!this.alive || target.faction === this.faction) {
       return;
     }
     this.state = 'attacking';
+    this.attackOrdered = ordered;
     this.targetEntity = target;
     this.targetPoint = undefined;
     this.gatherNode = undefined;
@@ -119,6 +124,7 @@ export class Unit extends Entity {
     this.gatherNode = undefined;
     this.buildTarget = undefined;
     this.gatherElapsed = 0;
+    this.buildingActive = false;
   }
 
   update(deltaSeconds: number, level: LevelScene): void {
@@ -131,7 +137,7 @@ export class Unit extends Entity {
     if (this.state === 'idle' && this.isCombatUnit) {
       const target = level.findNearestEnemy(this, COMBAT.aggroRadius);
       if (target) {
-        this.attack(target);
+        this.attack(target, false);
       }
     }
 
@@ -172,7 +178,38 @@ export class Unit extends Entity {
       g.fillTriangle(-5, -22, 5, -22, 0, -28);
     }
 
+    // Gather progress: a ring over the head fills while the Forager is harvesting at a node
+    // (gatherElapsed only ticks up once it has actually reached the node, not while walking).
+    if (this.state === 'gathering' && this.gatherNode && this.gatherElapsed > 0) {
+      const total = RESOURCE_CONFIG[this.gatherNode.kind].gatherSeconds;
+      const colour = this.gatherNode.kind === 'crumbs' ? 0xe8c46b : 0x8fd47a;
+      this.drawProgressRing(this.gatherElapsed / total, colour);
+    }
+
+    // Build progress: the same ring, driven by the building's construction progress, shown
+    // only once the Forager is on site and actually building (not while walking there).
+    if (this.state === 'building' && this.buildingActive && this.buildTarget) {
+      this.drawProgressRing(this.buildTarget.buildProgress, 0xd9b247);
+    }
+
     this.drawHealth(34, -27);
+  }
+
+  // Draws a small progress ring over the unit's head (used for gather and build progress).
+  private drawProgressRing(progress: number, colour: number): void {
+    const g = this.overlay;
+    const pct = Phaser.Math.Clamp(progress, 0, 1);
+    const radius = 6;
+    const cy = -19;
+    const start = -Math.PI / 2;
+    g.lineStyle(2, 0x11151c, 0.7);
+    g.beginPath();
+    g.arc(0, cy, radius, 0, Math.PI * 2);
+    g.strokePath();
+    g.lineStyle(2, colour, 0.95);
+    g.beginPath();
+    g.arc(0, cy, radius, start, start + pct * Math.PI * 2);
+    g.strokePath();
   }
 
   private updateGathering(deltaSeconds: number, level: LevelScene): void {
@@ -225,17 +262,22 @@ export class Unit extends Entity {
 
   private updateBuilding(deltaSeconds: number, level: LevelScene): void {
     if (!this.buildTarget || !this.buildTarget.alive) {
+      this.buildingActive = false;
       this.stop();
       return;
     }
 
     const buildPoint = level.getBuildingApproachPoint(this.buildTarget, this.position, this.radius + 10);
     if (!this.moveTowards(buildPoint, deltaSeconds, 6, level, this.buildTarget)) {
+      this.buildingActive = false;
       return;
     }
 
+    // The Forager has reached the site and is now actively constructing (drives the ring).
+    this.buildingActive = true;
     this.buildTarget.advanceConstruction(deltaSeconds);
     if (this.buildTarget.built) {
+      this.buildingActive = false;
       this.stop();
     }
   }
@@ -249,7 +291,13 @@ export class Unit extends Entity {
 
     const config = UNIT_CONFIG[this.kind];
     const currentDistance = distance(this.position, target.position);
-    if (currentDistance > COMBAT.aggroRadius * COMBAT.leashMultiplier && this.isCombatUnit) {
+    // Only auto-acquired targets leash: give up and return to post if the target strays
+    // beyond 1.5x aggro from this unit's home post. Ordered attacks chase to the death.
+    if (
+      !this.attackOrdered &&
+      this.isCombatUnit &&
+      distance(this.homePost, target.position) > COMBAT.aggroRadius * COMBAT.leashMultiplier
+    ) {
       this.moveTo(this.homePost);
       return;
     }

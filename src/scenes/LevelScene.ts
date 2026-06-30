@@ -445,6 +445,46 @@ export class LevelScene extends Phaser.Scene {
     return true;
   }
 
+  // Used by the AI to find an empty, on-grid spot for a building near a reference
+  // point (its Main Nest). Searches outward in rings so the AI rebuilds close to home.
+  findBuildPlacement(kind: BuildingKind, near: Point): Point | undefined {
+    const config = BUILDING_CONFIG[kind];
+    for (let ring = 1; ring <= 8; ring += 1) {
+      const radius = ring * WORLD.grid * 2;
+      for (let step = 0; step < 12; step += 1) {
+        const angle = (step / 12) * Math.PI * 2;
+        const centre = {
+          x: clamp(gridSnap(near.x + Math.cos(angle) * radius, WORLD.grid), config.width / 2, WORLD.width - config.width / 2),
+          y: clamp(gridSnap(near.y + Math.sin(angle) * radius, WORLD.grid), config.height / 2, WORLD.height - config.height / 2)
+        };
+        if (this.isValidBuildingSpot(centre, kind)) {
+          return centre;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  // Used by the AI to start constructing a building with a chosen Forager. Mirrors the
+  // player's tryPlaceBuilding flow (validate spot, charge resources, assign the builder)
+  // but without any UI/ghost. Returns false if the spot is invalid or unaffordable.
+  startConstruction(faction: Faction, kind: BuildingKind, builder: Unit, centre: Point): boolean {
+    const cost = BUILDING_CONFIG[kind].cost;
+    const stockpile = this.resources[faction];
+    if (stockpile.crumbs < cost.crumbs || stockpile.twigs < cost.twigs) {
+      return false;
+    }
+    if (!this.isValidBuildingSpot(centre, kind)) {
+      return false;
+    }
+
+    stockpile.crumbs -= cost.crumbs;
+    stockpile.twigs -= cost.twigs;
+    const building = this.addBuilding(kind, faction, centre.x, centre.y, false);
+    builder.build(building);
+    return true;
+  }
+
   private createTerrain(): void {
     this.add
       .tileSprite(WORLD.width / 2, WORLD.height / 2, WORLD.width, WORLD.height, TEXTURE_KEYS.grassTile)
@@ -813,15 +853,22 @@ export class LevelScene extends Phaser.Scene {
 
     const pointer = this.input.activePointer;
     const settings = getSettings();
-    if (settings.edgeScrollEnabled && !this.isTouchPointer(pointer) && !this.isPointerOverHud(pointer.y)) {
+    // Edge-scroll is anchored to the *visible playfield*, not the raw screen. The top/bottom
+    // HUD bars occlude the screen's true top/bottom edges, so triggering there would force
+    // the cursor behind the HUD. Instead we scroll near the inner edges of the playfield.
+    // The bottom band stops at the HUD so it never fights the command buttons; left/right use
+    // the screen edges directly since nothing occludes them.
+    if (settings.edgeScrollEnabled && !this.isTouchPointer(pointer)) {
+      const playTop = this.topHudHeight();
+      const playBottom = this.scale.height - this.bottomHudHeight();
       if (pointer.x <= WORLD.cameraEdge) {
         dx -= 1;
       } else if (pointer.x >= this.scale.width - WORLD.cameraEdge) {
         dx += 1;
       }
-      if (pointer.y <= WORLD.cameraEdge) {
+      if (pointer.y <= playTop + WORLD.cameraEdge) {
         dy -= 1;
-      } else if (pointer.y >= this.scale.height - WORLD.cameraEdge) {
+      } else if (pointer.y >= playBottom - WORLD.cameraEdge && pointer.y <= playBottom) {
         dy += 1;
       }
     }
@@ -832,7 +879,10 @@ export class LevelScene extends Phaser.Scene {
   }
 
   private beginPlacement(kind: BuildingKind): void {
-    const builder = this.selectedOwnUnits().find((unit) => unit.kind === 'forager');
+    const foragers = this.selectedOwnUnits().filter((unit) => unit.kind === 'forager');
+    // Prefer a Forager that isn't already mid-construction, so chained builds spread across
+    // the selection instead of yanking one busy Forager off its current site.
+    const builder = foragers.find((unit) => unit.state !== 'building') ?? foragers[0];
     if (!builder) {
       this.setMessage('Select a Forager to build.');
       return;
@@ -896,7 +946,8 @@ export class LevelScene extends Phaser.Scene {
     this.resources.pigeon.twigs -= config.cost.twigs;
     const building = this.addBuilding(this.placement.kind, 'pigeon', this.placement.centre.x, this.placement.centre.y, false);
     this.placement.builder.build(building);
-    this.setSelection([building]);
+    // Keep the Forager(s) selected rather than switching to the half-built building, so the
+    // build buttons stay on screen and the player can immediately queue another structure.
     this.setMessage(`${config.label} started.`);
     this.cancelPlacement();
   }
