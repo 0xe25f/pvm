@@ -133,6 +133,9 @@ export class UIScene extends Phaser.Scene {
     }
 
     if (!snapshot.gameOver) {
+      // Destroy the buttons when hiding: Phaser input ignores parent-container visibility, so
+      // leaving them in place keeps their hit areas live and clickable during normal play.
+      this.endLayer.removeAll(true);
       this.endLayer.setVisible(false);
       return;
     }
@@ -164,6 +167,10 @@ export class UIScene extends Phaser.Scene {
     }
 
     if (!snapshot.paused || !snapshot.pauseMenu || snapshot.gameOver) {
+      // Destroy the buttons when hiding: Phaser input ignores parent-container visibility, so
+      // a hidden "Load Game" / "Exit to Menu" button would otherwise stay clickable mid-game
+      // and could restart or exit the level from a stray click. This was the phantom reset.
+      this.pauseLayer.removeAll(true);
       this.pauseLayer.setVisible(false);
       return;
     }
