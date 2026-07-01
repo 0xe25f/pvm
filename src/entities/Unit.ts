@@ -11,6 +11,13 @@ import type { LevelScene } from '../scenes/LevelScene';
 
 export type AttackTarget = Unit | Building;
 
+// Path-following tuning: how close counts as "reached" for an intermediate waypoint, how far
+// the goal must move before we recompute, and the periodic re-route interval (for moving
+// targets or buildings raised mid-journey).
+const PATH_NODE_REACH = 8;
+const PATH_REPATH_DISTANCE = 28;
+const PATH_REPATH_SECONDS = 0.5;
+
 export class Unit extends Entity {
   readonly kind: UnitKind;
   state: UnitState = 'idle';
@@ -23,8 +30,13 @@ export class Unit extends Entity {
     amount: number;
   };
   homePost: Point;
+  private attackOrdered = false;
+  private buildingActive = false;
   private gatherElapsed = 0;
   private attackElapsed = 0;
+  private navPath: Point[] = [];
+  private navGoal?: Point;
+  private navRepathTimer = 0;
   private sprite: Phaser.GameObjects.Image;
 
   constructor(scene: Phaser.Scene, kind: UnitKind, faction: Faction, x: number, y: number) {
@@ -75,17 +87,22 @@ export class Unit extends Entity {
     this.gatherNode = undefined;
     this.buildTarget = undefined;
     this.gatherElapsed = 0;
+    this.clearPath();
   }
 
-  attack(target: AttackTarget): void {
+  // `ordered` distinguishes an explicit player/AI attack command (chase the target wherever
+  // it goes) from an auto-acquired target picked up while idle (which leashes back to post).
+  attack(target: AttackTarget, ordered = true): void {
     if (!this.alive || target.faction === this.faction) {
       return;
     }
     this.state = 'attacking';
+    this.attackOrdered = ordered;
     this.targetEntity = target;
     this.targetPoint = undefined;
     this.gatherNode = undefined;
     this.buildTarget = undefined;
+    this.clearPath();
   }
 
   gather(node: ResourceNode): void {
@@ -98,6 +115,7 @@ export class Unit extends Entity {
     this.targetPoint = undefined;
     this.buildTarget = undefined;
     this.gatherElapsed = 0;
+    this.clearPath();
   }
 
   build(building: Building): void {
@@ -110,15 +128,18 @@ export class Unit extends Entity {
     this.targetEntity = undefined;
     this.gatherNode = undefined;
     this.gatherElapsed = 0;
+    this.clearPath();
   }
 
   stop(): void {
     this.state = 'idle';
+    this.clearPath();
     this.targetPoint = undefined;
     this.targetEntity = undefined;
     this.gatherNode = undefined;
     this.buildTarget = undefined;
     this.gatherElapsed = 0;
+    this.buildingActive = false;
   }
 
   update(deltaSeconds: number, level: LevelScene): void {
@@ -131,7 +152,10 @@ export class Unit extends Entity {
     if (this.state === 'idle' && this.isCombatUnit) {
       const target = level.findNearestEnemy(this, COMBAT.aggroRadius);
       if (target) {
-        this.attack(target);
+        // Guard the spot the unit is actually standing on, not its birth spawn, so the leash
+        // pulls it back here after a short chase instead of fleeing across the map.
+        this.homePost = { x: this.x, y: this.y };
+        this.attack(target, false);
       }
     }
 
@@ -172,7 +196,37 @@ export class Unit extends Entity {
       g.fillTriangle(-5, -22, 5, -22, 0, -28);
     }
 
+    // Gather progress: a bar above the head fills while the Forager is harvesting at a node
+    // (gatherElapsed only ticks up once it has actually reached the node, not while walking).
+    if (this.state === 'gathering' && this.gatherNode && this.gatherElapsed > 0) {
+      const total = RESOURCE_CONFIG[this.gatherNode.kind].gatherSeconds;
+      const colour = this.gatherNode.kind === 'crumbs' ? 0xe8c46b : 0x8fd47a;
+      this.drawProgressBar(this.gatherElapsed / total, colour);
+    }
+
+    // Build progress: the same bar, driven by the building's construction progress, shown
+    // only once the Forager is on site and actually building (not while walking there).
+    if (this.state === 'building' && this.buildingActive && this.buildTarget) {
+      this.drawProgressBar(this.buildTarget.buildProgress, 0xd9b247);
+    }
+
     this.drawHealth(34, -27);
+  }
+
+  // Draws a small progress bar above the unit's head (used for gather and build progress).
+  // Mirrors the building queue/health bars so it renders clearly above the sprite.
+  private drawProgressBar(progress: number, colour: number): void {
+    const g = this.overlay;
+    const pct = Phaser.Math.Clamp(progress, 0, 1);
+    const width = 32;
+    const height = 7;
+    const y = -38;
+    g.fillStyle(0x05070a, 0.9);
+    g.fillRoundedRect(-width / 2 - 1, y - 1, width + 2, height + 2, 2);
+    g.fillStyle(0x11151c, 0.85);
+    g.fillRoundedRect(-width / 2, y, width, height, 2);
+    g.fillStyle(colour, 1);
+    g.fillRoundedRect(-width / 2 + 1, y + 1, (width - 2) * pct, height - 2, 2);
   }
 
   private updateGathering(deltaSeconds: number, level: LevelScene): void {
@@ -225,17 +279,22 @@ export class Unit extends Entity {
 
   private updateBuilding(deltaSeconds: number, level: LevelScene): void {
     if (!this.buildTarget || !this.buildTarget.alive) {
+      this.buildingActive = false;
       this.stop();
       return;
     }
 
     const buildPoint = level.getBuildingApproachPoint(this.buildTarget, this.position, this.radius + 10);
     if (!this.moveTowards(buildPoint, deltaSeconds, 6, level, this.buildTarget)) {
+      this.buildingActive = false;
       return;
     }
 
+    // The Forager has reached the site and is now actively constructing (drives the ring).
+    this.buildingActive = true;
     this.buildTarget.advanceConstruction(deltaSeconds);
     if (this.buildTarget.built) {
+      this.buildingActive = false;
       this.stop();
     }
   }
@@ -249,7 +308,13 @@ export class Unit extends Entity {
 
     const config = UNIT_CONFIG[this.kind];
     const currentDistance = distance(this.position, target.position);
-    if (currentDistance > COMBAT.aggroRadius * COMBAT.leashMultiplier && this.isCombatUnit) {
+    // Only auto-acquired targets leash: give up and return to post if the target strays
+    // beyond 1.5x aggro from this unit's home post. Ordered attacks chase to the death.
+    if (
+      !this.attackOrdered &&
+      this.isCombatUnit &&
+      distance(this.homePost, target.position) > COMBAT.aggroRadius * COMBAT.leashMultiplier
+    ) {
       this.moveTo(this.homePost);
       return;
     }
@@ -275,18 +340,41 @@ export class Unit extends Entity {
     level?: LevelScene,
     ignoreBuilding?: Building
   ): boolean {
-    const waypoint = level?.getMovementWaypoint(this.position, point, this.radius, ignoreBuilding);
-    const activeTarget = waypoint ?? point;
-    const activeStopDistance = waypoint ? 5 : stopDistance;
-    const dx = activeTarget.x - this.x;
-    const dy = activeTarget.y - this.y;
+    // (Re)compute a route when the goal changes meaningfully, the cached path is exhausted, or
+    // the periodic refresh fires (lets units re-route around buildings raised mid-journey and
+    // keep chasing a moving target). When no level is provided, fall back to straight steering.
+    this.navRepathTimer -= deltaSeconds;
+    const goalMoved = !this.navGoal || distance(this.navGoal, point) > PATH_REPATH_DISTANCE;
+    if (level && (goalMoved || this.navPath.length === 0 || this.navRepathTimer <= 0)) {
+      this.navPath = level.requestPath(this.position, point, this.radius, ignoreBuilding);
+      this.navGoal = { x: point.x, y: point.y };
+      this.navRepathTimer = PATH_REPATH_SECONDS;
+    }
+    if (this.navPath.length === 0) {
+      this.navPath = [point];
+    }
+
+    // Drop intermediate waypoints already reached; steer toward the next one.
+    while (this.navPath.length > 1 && distance(this.position, this.navPath[0]) <= PATH_NODE_REACH) {
+      this.navPath.shift();
+    }
+    const isFinal = this.navPath.length <= 1;
+    const node = this.navPath[0];
+    const reach = isFinal ? stopDistance : PATH_NODE_REACH;
+
+    const dx = node.x - this.x;
+    const dy = node.y - this.y;
     const length = Math.hypot(dx, dy);
-    if (length <= activeStopDistance) {
-      return !waypoint;
+    if (length <= reach) {
+      if (isFinal) {
+        return true;
+      }
+      this.navPath.shift();
+      return false;
     }
 
     const dir = normalise(dx, dy);
-    const step = Math.min(length - activeStopDistance, this.speed * deltaSeconds);
+    const step = Math.min(length - reach, this.speed * deltaSeconds);
     const next = level?.resolveUnitBuildingOverlap(
       this,
       {
@@ -303,6 +391,12 @@ export class Unit extends Entity {
       this.sprite.setFlipX(dir.x < 0);
     }
     return false;
+  }
+
+  private clearPath(): void {
+    this.navPath = [];
+    this.navGoal = undefined;
+    this.navRepathTimer = 0;
   }
 
   private textureFor(): string {

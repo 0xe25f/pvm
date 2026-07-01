@@ -25,11 +25,16 @@ import {
   type SavedUnitState
 } from '../persistence/GamePersistence';
 import { AISystem } from '../systems/AISystem';
+import { findGridPath, type ObstacleRect } from '../systems/Pathfinding';
 import type { BuildingKind, Faction, HudCommand, HudSelection, HudSnapshot, Point, ResourceKind, Stockpile, UnitKind } from '../types';
 import { clamp, distance, distanceSq, gridSnap, spiralOffset } from '../utils/math';
 
 type Selectable = Unit | Building;
 type CommandTarget = Selectable | ResourceNode | undefined;
+
+// Grid resolution for A* pathfinding. 25px (half the building grid) routes smoothly around
+// the prototype's buildings without an expensive cell count (a ~80x80 grid).
+const PATH_CELL = 25;
 
 interface PlacementState {
   kind: BuildingKind;
@@ -324,35 +329,65 @@ export class LevelScene extends Phaser.Scene {
     };
   }
 
-  getMovementWaypoint(from: Point, target: Point, radius: number, ignoreBuilding?: Building): Point | undefined {
-    const blocker = this.findBlockingBuilding(from, target, radius + 8, ignoreBuilding);
-    if (!blocker) {
-      return undefined;
+  // Returns a list of waypoints from `from` to `target` that routes around buildings, or just
+  // [target] when the straight line is already clear. This is the single pathfinding seam the
+  // spec calls for: it runs grid A* (see systems/Pathfinding) and string-pulls the result so
+  // units follow smooth diagonals rather than blocky grid steps. `ignoreBuilding` lets a unit
+  // path right up to a building it is heading for (its drop-off nest or build site).
+  requestPath(from: Point, target: Point, radius: number, ignoreBuilding?: Building): Point[] {
+    if (!this.findBlockingBuilding(from, target, radius + 4, ignoreBuilding)) {
+      return [target];
     }
 
-    const pad = radius + 18;
-    const left = blocker.x - blocker.width / 2 - pad;
-    const right = blocker.x + blocker.width / 2 + pad;
-    const top = blocker.y - blocker.height / 2 - pad;
-    const bottom = blocker.y + blocker.height / 2 + pad;
-    const candidates: Point[] = [
-      { x: left, y: top },
-      { x: right, y: top },
-      { x: left, y: bottom },
-      { x: right, y: bottom },
-      { x: blocker.x, y: top },
-      { x: blocker.x, y: bottom },
-      { x: left, y: blocker.y },
-      { x: right, y: blocker.y }
-    ].map((point) => ({
-      x: clamp(point.x, 20, WORLD.width - 20),
-      y: clamp(point.y, 20, WORLD.height - 20)
-    }));
+    const obstacles = this.pathObstacles(radius, ignoreBuilding);
+    const path = findGridPath(from, target, obstacles, {
+      worldWidth: WORLD.width,
+      worldHeight: WORLD.height,
+      cell: PATH_CELL
+    });
+    if (!path || path.length === 0) {
+      return [target];
+    }
 
-    return candidates
-      .filter((point) => !this.isPointInsideBuilding(point, radius, ignoreBuilding))
-      .filter((point) => !this.findBlockingBuilding(from, point, radius + 6, ignoreBuilding))
-      .sort((a, b) => distance(from, a) + distance(a, target) - (distance(from, b) + distance(b, target)))[0];
+    return this.smoothPath(from, path, radius, ignoreBuilding);
+  }
+
+  private pathObstacles(radius: number, ignoreBuilding?: Building): ObstacleRect[] {
+    const inflate = radius + 6;
+    const obstacles: ObstacleRect[] = [];
+    for (const building of this.buildings) {
+      if (!building.alive || building === ignoreBuilding) {
+        continue;
+      }
+      obstacles.push({
+        left: building.x - building.width / 2 - inflate,
+        right: building.x + building.width / 2 + inflate,
+        top: building.y - building.height / 2 - inflate,
+        bottom: building.y + building.height / 2 + inflate
+      });
+    }
+    return obstacles;
+  }
+
+  // String-pulling: collapse runs of grid waypoints that the unit can already reach in a
+  // straight clear line, keeping only the corners that actually matter.
+  private smoothPath(from: Point, path: Point[], radius: number, ignoreBuilding?: Building): Point[] {
+    const result: Point[] = [];
+    let anchor = from;
+    let index = 0;
+    while (index < path.length) {
+      let furthest = index;
+      for (let candidate = index; candidate < path.length; candidate += 1) {
+        if (this.findBlockingBuilding(anchor, path[candidate], radius + 2, ignoreBuilding)) {
+          break;
+        }
+        furthest = candidate;
+      }
+      result.push(path[furthest]);
+      anchor = path[furthest];
+      index = furthest + 1;
+    }
+    return result;
   }
 
   resolveUnitBuildingOverlap(unit: Unit, point: Point, ignoreBuilding?: Building): Point {
@@ -442,6 +477,46 @@ export class LevelScene extends Phaser.Scene {
     if (!silent && building.faction === 'pigeon') {
       this.setMessage(`Training ${config.label}.`);
     }
+    return true;
+  }
+
+  // Used by the AI to find an empty, on-grid spot for a building near a reference
+  // point (its Main Nest). Searches outward in rings so the AI rebuilds close to home.
+  findBuildPlacement(kind: BuildingKind, near: Point): Point | undefined {
+    const config = BUILDING_CONFIG[kind];
+    for (let ring = 1; ring <= 8; ring += 1) {
+      const radius = ring * WORLD.grid * 2;
+      for (let step = 0; step < 12; step += 1) {
+        const angle = (step / 12) * Math.PI * 2;
+        const centre = {
+          x: clamp(gridSnap(near.x + Math.cos(angle) * radius, WORLD.grid), config.width / 2, WORLD.width - config.width / 2),
+          y: clamp(gridSnap(near.y + Math.sin(angle) * radius, WORLD.grid), config.height / 2, WORLD.height - config.height / 2)
+        };
+        if (this.isValidBuildingSpot(centre, kind)) {
+          return centre;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  // Used by the AI to start constructing a building with a chosen Forager. Mirrors the
+  // player's tryPlaceBuilding flow (validate spot, charge resources, assign the builder)
+  // but without any UI/ghost. Returns false if the spot is invalid or unaffordable.
+  startConstruction(faction: Faction, kind: BuildingKind, builder: Unit, centre: Point): boolean {
+    const cost = BUILDING_CONFIG[kind].cost;
+    const stockpile = this.resources[faction];
+    if (stockpile.crumbs < cost.crumbs || stockpile.twigs < cost.twigs) {
+      return false;
+    }
+    if (!this.isValidBuildingSpot(centre, kind)) {
+      return false;
+    }
+
+    stockpile.crumbs -= cost.crumbs;
+    stockpile.twigs -= cost.twigs;
+    const building = this.addBuilding(kind, faction, centre.x, centre.y, false);
+    builder.build(building);
     return true;
   }
 
@@ -813,15 +888,22 @@ export class LevelScene extends Phaser.Scene {
 
     const pointer = this.input.activePointer;
     const settings = getSettings();
-    if (settings.edgeScrollEnabled && !this.isTouchPointer(pointer) && !this.isPointerOverHud(pointer.y)) {
+    // Edge-scroll is anchored to the *visible playfield*, not the raw screen. The top/bottom
+    // HUD bars occlude the screen's true top/bottom edges, so triggering there would force
+    // the cursor behind the HUD. Instead we scroll near the inner edges of the playfield.
+    // The bottom band stops at the HUD so it never fights the command buttons; left/right use
+    // the screen edges directly since nothing occludes them.
+    if (settings.edgeScrollEnabled && !this.isTouchPointer(pointer)) {
+      const playTop = this.topHudHeight();
+      const playBottom = this.scale.height - this.bottomHudHeight();
       if (pointer.x <= WORLD.cameraEdge) {
         dx -= 1;
       } else if (pointer.x >= this.scale.width - WORLD.cameraEdge) {
         dx += 1;
       }
-      if (pointer.y <= WORLD.cameraEdge) {
+      if (pointer.y <= playTop + WORLD.cameraEdge) {
         dy -= 1;
-      } else if (pointer.y >= this.scale.height - WORLD.cameraEdge) {
+      } else if (pointer.y >= playBottom - WORLD.cameraEdge && pointer.y <= playBottom) {
         dy += 1;
       }
     }
@@ -832,7 +914,10 @@ export class LevelScene extends Phaser.Scene {
   }
 
   private beginPlacement(kind: BuildingKind): void {
-    const builder = this.selectedOwnUnits().find((unit) => unit.kind === 'forager');
+    const foragers = this.selectedOwnUnits().filter((unit) => unit.kind === 'forager');
+    // Prefer a Forager that isn't already mid-construction, so chained builds spread across
+    // the selection instead of yanking one busy Forager off its current site.
+    const builder = foragers.find((unit) => unit.state !== 'building') ?? foragers[0];
     if (!builder) {
       this.setMessage('Select a Forager to build.');
       return;
@@ -896,7 +981,8 @@ export class LevelScene extends Phaser.Scene {
     this.resources.pigeon.twigs -= config.cost.twigs;
     const building = this.addBuilding(this.placement.kind, 'pigeon', this.placement.centre.x, this.placement.centre.y, false);
     this.placement.builder.build(building);
-    this.setSelection([building]);
+    // Keep the Forager(s) selected rather than switching to the half-built building, so the
+    // build buttons stay on screen and the player can immediately queue another structure.
     this.setMessage(`${config.label} started.`);
     this.cancelPlacement();
   }
